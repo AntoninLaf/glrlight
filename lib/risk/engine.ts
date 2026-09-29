@@ -1,23 +1,38 @@
 /**
  * lib/risk/engine.ts
  *
- * The risk engine. Turns a Dossier (raw facts from Companies House) into an
- * Assessment (scored signals plus a green/amber/red band).
+ * Turns a Dossier (raw facts from Companies House) into an Assessment (scored
+ * signals plus a green/amber/red band).
  *
  * DESIGN RULE: no AI in this file, ever. Everything here is deterministic —
  * the same dossier always produces the same score. That is what makes the
  * output auditable, testable, and defensible. The AI layer only explains what
  * this file decided; it never changes the number.
  *
- * CALIBRATION HISTORY
- * v1 flagged Greggs PLC and Tesco PLC as amber — both entirely healthy. Four
- * assumptions were wrong, and each fix is marked "CALIBRATION v2" below:
+ * ── CALIBRATION HISTORY ──────────────────────────────────────────────────
+ *
+ * v1 rated Greggs and Tesco amber — both entirely healthy. Four assumptions
+ * were wrong, each a domain error rather than a coding bug:
  *   1. Dissolution was counted as company failure. It usually is not.
  *   2. Listed companies were penalised for having no PSC. They are exempt.
- *   3. Director departures were counted absolutely, not relative to board size.
+ *   3. Director departures were counted absolutely, not against board size.
  *   4. Name changes had no recency window, so 1980s rebrands still scored.
- * For a screening tool, false positives are more damaging than misses: users
- * who see healthy companies flagged stop trusting every flag.
+ *
+ * v3 came out of the backtest (scripts/backtest.ts), which surfaced a defect
+ * rather than a miscalibration:
+ *   5. AS-OF DATE. Every time-window rule compared dates against Date.now().
+ *      Scoring a company as it stood in 2008 therefore asked "did anyone
+ *      resign in the last 12 months of 2026?" — so half the engine silently
+ *      never fired during the entire backtest. Rules now take an explicit
+ *      `asOf` date.
+ *   6. PSC ANACHRONISM. The PSC register did not exist before 6 April 2016.
+ *      The rule was flagging every company in Britain for not complying with
+ *      a law that had not been written.
+ *   7. TWO RULES CARRIED NO INFORMATION. `stale_accounts` fired in 95% of
+ *      failures and 100% of survivors; `heavy_charge_load` was 10% vs 22%,
+ *      i.e. mildly backwards. Both now score zero and remain only as context.
+ *      A signal that fires equally in both groups has zero discriminating
+ *      power by definition — demoting it is principled, not curve-fitting.
  */
 
 import type { Dossier } from "../ch/types";
@@ -29,7 +44,6 @@ import type { Dossier } from "../ch/types";
 export type Severity = "info" | "low" | "medium" | "high";
 export type Band = "green" | "amber" | "red";
 
-/** How many points each severity contributes to the total. */
 const POINTS: Record<Severity, number> = {
   info: 0,
   low: 1,
@@ -37,28 +51,18 @@ const POINTS: Record<Severity, number> = {
   high: 5,
 };
 
-/**
- * Score thresholds.
- *
- * CALIBRATION v2: amber raised from 3 to 4, so a single medium signal no
- * longer tips a company out of green on its own. One notable fact is worth
- * reading; it is not worth a warning.
- */
 const AMBER_AT = 4;
 const RED_AT = 8;
 
 /**
- * One thing we noticed about the company.
- *
- * Every signal carries a `benign` field. This is deliberate: a tool that only
- * ever says "concerning" trains its users to ignore it. Presenting the
- * innocent explanation alongside the flag is what makes the alarming reading
- * credible when it matters.
+ * The PSC (people with significant control) register came into force on
+ * 6 April 2016. Before that date, no company had one — so the absence of a
+ * PSC entry says nothing at all.
  */
+const PSC_REGISTER_START = new Date("2016-04-06");
+
 export interface Signal {
-  /** Stable machine name, e.g. "accounts_overdue". Used in tests and the UI. */
   id: string;
-  /** Short human title. */
   label: string;
   severity: Severity;
   /** What we actually found, with dates. This is the evidence. */
@@ -75,9 +79,7 @@ export interface Assessment {
   band: Band;
   score: number;
   signals: Signal[];
-  /** Set when a decisive fact bypassed the arithmetic entirely. */
   override?: string;
-  /** Sub-resources that failed to load, so the UI can be honest about gaps. */
   dataGaps: string[];
   assessedAt: string;
 }
@@ -87,19 +89,21 @@ export interface Assessment {
 /* ------------------------------------------------------------------ */
 
 /**
- * How many months ago was this date? Returns null for missing or unparseable
- * dates, so callers must decide what to do about missing data rather than
- * silently treating it as "now".
+ * How many months before `asOf` was this date?
+ *
+ * `asOf` is passed in rather than assumed to be now. That one parameter is
+ * what makes historical scoring possible — without it every "in the last 12
+ * months" rule silently measures from today, which is exactly the defect the
+ * backtest exposed.
  */
-function monthsSince(isoDate?: string): number | null {
+function monthsBefore(isoDate: string | undefined, asOf: Date): number | null {
   if (!isoDate) return null;
   const then = new Date(isoDate);
   if (Number.isNaN(then.getTime())) return null;
-  const msPerMonth = 1000 * 60 * 60 * 24 * 30.44; // average month length
-  return (Date.now() - then.getTime()) / msPerMonth;
+  const msPerMonth = 1000 * 60 * 60 * 24 * 30.44;
+  return (asOf.getTime() - then.getTime()) / msPerMonth;
 }
 
-/** Statuses meaning the company is already in a formal insolvency process. */
 const DISTRESSED_STATUSES = [
   "liquidation",
   "administration",
@@ -109,15 +113,10 @@ const DISTRESSED_STATUSES = [
 ];
 
 /**
- * CALIBRATION v2 — the most important fix in this file.
- *
- * A company being DISSOLVED usually means it was closed down voluntarily and
- * solvently: dormant subsidiaries get struck off as routine group housekeeping,
- * and any active director of a large group accumulates dozens of them. Treating
- * that as failure made every experienced plc director look like a serial
- * bankrupt, which is what put Tesco in amber.
- *
- * Genuine failure is insolvency: liquidation, administration, receivership.
+ * A company being DISSOLVED usually means it was closed voluntarily and
+ * solvently — dormant subsidiaries are struck off as routine housekeeping, and
+ * any director of a large group accumulates dozens. Genuine failure is
+ * insolvency. Conflating the two was v1's largest false-positive source.
  */
 const INSOLVENT_OUTCOMES = [
   "liquidation",
@@ -126,49 +125,44 @@ const INSOLVENT_OUTCOMES = [
   "insolvency-proceedings",
 ];
 
-/** True for public limited companies, which follow different disclosure rules. */
 function isListedCompany(d: Dossier): boolean {
   return d.profile.type?.toLowerCase().includes("plc") ?? false;
 }
 
-/**
- * The size of the board over the last year: directors still serving, plus
- * those who left during the period. Used to judge departures proportionally.
- */
-function boardSizeLastYear(d: Dossier): number {
+/** Directors serving during the year before `asOf`, plus those who left in it. */
+function boardSize(d: Dossier, asOf: Date): number {
   const active = d.officers.filter((o) => o.active && o.role.includes("director")).length;
   const departed = d.officers.filter((o) => {
-    const age = monthsSince(o.resignedOn);
-    return age !== null && age <= 12 && o.role.includes("director");
+    const age = monthsBefore(o.resignedOn, asOf);
+    return age !== null && age >= 0 && age <= 12 && o.role.includes("director");
   }).length;
   return active + departed;
+}
+
+/** True when a date falls inside the `months` window ending at `asOf`. */
+function within(isoDate: string | undefined, months: number, asOf: Date): boolean {
+  const age = monthsBefore(isoDate, asOf);
+  return age !== null && age >= 0 && age <= months;
 }
 
 /* ------------------------------------------------------------------ */
 /* The rules                                                           */
 /* ------------------------------------------------------------------ */
-/*
- * Each rule is a function that takes the dossier and returns either a Signal
- * or null (meaning "nothing to report"). They are deliberately small and
- * independent: adding a new signal means writing one function and adding it to
- * the RULES list at the bottom. Nothing else changes.
- */
 
-type Rule = (d: Dossier) => Signal | null;
+type Rule = (d: Dossier, asOf: Date) => Signal | null;
 
 // ---- Filing behaviour ----------------------------------------------------
 
-const accountsOverdue: Rule = (d) => {
+const accountsOverdue: Rule = (d, asOf) => {
   if (!d.profile.accounts.overdue) return null;
 
   const due = d.profile.accounts.nextDue;
-  const late = monthsSince(due);
-  const howLate = late !== null ? `${late.toFixed(1)} months late` : "overdue";
+  const late = monthsBefore(due, asOf);
+  const howLate = late !== null && late > 0 ? `${late.toFixed(1)} months late` : "overdue";
 
   return {
     id: "accounts_overdue",
     label: "Annual accounts overdue",
-    // Being months late is materially different from being days late.
     severity: late !== null && late > 3 ? "high" : "medium",
     detail: `Accounts were due ${due ?? "on an unknown date"} and are ${howLate}.`,
     benign:
@@ -184,10 +178,12 @@ const confirmationStatementOverdue: Rule = (d) => {
   return {
     id: "confirmation_overdue",
     label: "Confirmation statement overdue",
-    severity: "low",
+    // Backtest: 30% of failures vs 11% of survivors — one of the better
+    // discriminators, and cheap to file, so missing it is meaningful.
+    severity: "medium",
     detail: `The annual confirmation statement was due ${
       d.profile.confirmationStatement.nextDue ?? "at an unknown date"
-    } and has not been filed.`,
+    } and had not been filed.`,
     benign:
       "This filing is a formality and costs very little to submit, so missing " +
       "it usually signals inattention rather than difficulty.",
@@ -195,19 +191,20 @@ const confirmationStatementOverdue: Rule = (d) => {
   };
 };
 
-const staleAccounts: Rule = (d) => {
-  const age = monthsSince(d.profile.accounts.lastMadeUpTo);
-  // UK companies file up to 9 months after year end, so ~21 months is the
-  // point at which the newest published figures are unusually old.
+const staleAccounts: Rule = (d, asOf) => {
+  const age = monthsBefore(d.profile.accounts.lastMadeUpTo, asOf);
   if (age === null || age < 21) return null;
 
   return {
     id: "stale_accounts",
     label: "Published figures are unusually old",
-    severity: "low",
+    // Scores zero. Backtest: 95% of failures, 100% of survivors — it fires on
+    // nearly everything, so it separates nothing. Kept as context for the
+    // reader, removed from the arithmetic.
+    severity: "info",
     detail: `The most recent accounts cover a period ending ${
       d.profile.accounts.lastMadeUpTo
-    }, roughly ${Math.round(age)} months ago.`,
+    }, roughly ${Math.round(age)} months earlier.`,
     benign:
       "Normal filing lag can reach 21 months. This is a caution about how much " +
       "the financial picture can be trusted, not an accusation.",
@@ -217,11 +214,10 @@ const staleAccounts: Rule = (d) => {
 
 // ---- Register events -----------------------------------------------------
 
-const strikeOffAction: Rule = (d) => {
+const strikeOffAction: Rule = (d, asOf) => {
   const recent = d.filings.filter((f) => {
-    const age = monthsSince(f.date);
     const text = `${f.type} ${f.description ?? ""}`.toLowerCase();
-    return age !== null && age <= 18 && text.includes("strike-off");
+    return within(f.date, 18, asOf) && text.includes("strike-off");
   });
 
   if (recent.length === 0) return null;
@@ -239,13 +235,11 @@ const strikeOffAction: Rule = (d) => {
   };
 };
 
-const auditorResignation: Rule = (d) => {
-  // Heuristic: Companies House gives no clean flag for this, so we match text
-  // in filing descriptions. Imperfect, and labelled as such in the source line.
+const auditorResignation: Rule = (d, asOf) => {
+  // Heuristic: Companies House gives no clean flag, so we match filing text.
   const hits = d.filings.filter((f) => {
-    const age = monthsSince(f.date);
     const text = (f.description ?? "").toLowerCase();
-    return age !== null && age <= 24 && text.includes("auditor") && text.includes("resign");
+    return within(f.date, 24, asOf) && text.includes("auditor") && text.includes("resign");
   });
 
   if (hits.length === 0) return null;
@@ -262,21 +256,15 @@ const auditorResignation: Rule = (d) => {
   };
 };
 
-const previousNames: Rule = (d) => {
-  // CALIBRATION v2: only count name changes in the last five years. Tesco fired
-  // this rule on rebrands from the 1980s, which say nothing about today.
-  const recent = d.profile.previousNames.filter((n) => {
-    const age = monthsSince(n.ceasedOn);
-    return age !== null && age <= 60;
-  });
-
+const previousNames: Rule = (d, asOf) => {
+  const recent = d.profile.previousNames.filter((n) => within(n.ceasedOn, 60, asOf));
   if (recent.length < 2) return null;
 
   return {
     id: "multiple_name_changes",
     label: "Repeated recent name changes",
     severity: "low",
-    detail: `${recent.length} name changes in the last five years, most recently from ${recent[0]?.name}.`,
+    detail: `${recent.length} name changes in the preceding five years, most recently from ${recent[0]?.name}.`,
     benign:
       "Rebrands, acquisitions and group restructures all cause name changes. " +
       "Only notable when combined with other signals.",
@@ -305,19 +293,17 @@ const undeliverableAddress: Rule = (d) => {
 
 // ---- Governance ----------------------------------------------------------
 
-const directorChurn: Rule = (d) => {
-  const departures = d.officers.filter((o) => {
-    const age = monthsSince(o.resignedOn);
-    return age !== null && age <= 12 && o.role.includes("director");
-  });
+const directorChurn: Rule = (d, asOf) => {
+  const departures = d.officers.filter(
+    (o) => within(o.resignedOn, 12, asOf) && o.role.includes("director")
+  );
 
   if (departures.length < 2) return null;
 
-  // CALIBRATION v2: judge departures as a PROPORTION of the board.
-  // Three departures from a ten-person plc board is routine rotation; three
-  // from a four-person board is most of the leadership leaving. The absolute
-  // number carries no information on its own.
-  const board = boardSizeLastYear(d);
+  // Judge departures as a PROPORTION of the board. Three from a ten-person plc
+  // board is routine rotation; three from a board of four is the leadership
+  // walking out. The absolute number carries no information alone.
+  const board = boardSize(d, asOf);
   if (board === 0) return null;
 
   const share = departures.length / board;
@@ -327,7 +313,7 @@ const directorChurn: Rule = (d) => {
     id: "director_churn",
     label: "Large share of the board departed",
     severity: share >= 0.6 ? "high" : "medium",
-    detail: `${departures.length} of roughly ${board} directors resigned in the last 12 months (${Math.round(
+    detail: `${departures.length} of roughly ${board} directors resigned within 12 months (${Math.round(
       share * 100
     )}% of the board): ${departures.map((o) => `${o.name} (${o.resignedOn})`).join(", ")}.`,
     benign:
@@ -345,8 +331,9 @@ const noActiveDirectors: Rule = (d) => {
   return {
     id: "no_active_directors",
     label: "No active directors on the register",
+    // Backtest: fired only in companies that failed. Rare but clean.
     severity: "high",
-    detail: "Every director appointment has been resigned or terminated.",
+    detail: "Every director appointment had been resigned or terminated.",
     benign:
       "Sometimes a filing lag after a restructure. A UK company is legally " +
       "required to have at least one director, so this should not persist.",
@@ -356,12 +343,17 @@ const noActiveDirectors: Rule = (d) => {
 
 // ---- Ownership -----------------------------------------------------------
 
-const noPSC: Rule = (d) => {
+const noPSC: Rule = (d, asOf) => {
+  // The PSC register did not exist before 6 April 2016. Scoring its absence
+  // before that date flags every company in the country for not complying with
+  // a law that had not been written — which is exactly what the backtest
+  // caught (fired in 90% of failures AND 78% of survivors).
+  if (asOf < PSC_REGISTER_START) return null;
+
   if (d.profile.status !== "active") return null;
 
-  // CALIBRATION v2: listed companies are EXEMPT from the PSC register. They
-  // disclose ownership through stock-market rules instead. Penalising them for
-  // an empty PSC register flagged every plc in Britain, including Greggs.
+  // Listed companies are exempt: they disclose ownership through
+  // stock-market rules instead.
   if (isListedCompany(d)) return null;
 
   const activePSCs = d.pscs.filter((p) => !p.ceasedOn);
@@ -371,7 +363,7 @@ const noPSC: Rule = (d) => {
     id: "no_psc",
     label: "No person with significant control identified",
     severity: "low",
-    detail: "No active PSC is recorded against the company.",
+    detail: "No active PSC was recorded against the company.",
     benign:
       "Can be legitimate where ownership sits with an overseas parent. It does " +
       "reduce transparency about who is actually behind the company.",
@@ -379,19 +371,15 @@ const noPSC: Rule = (d) => {
   };
 };
 
-const controlChange: Rule = (d) => {
-  const recentlyCeased = d.pscs.filter((p) => {
-    const age = monthsSince(p.ceasedOn);
-    return age !== null && age <= 12;
-  });
-
+const controlChange: Rule = (d, asOf) => {
+  const recentlyCeased = d.pscs.filter((p) => within(p.ceasedOn, 12, asOf));
   if (recentlyCeased.length === 0) return null;
 
   return {
     id: "control_change",
     label: "Recent change of control",
     severity: "medium",
-    detail: `${recentlyCeased.length} controlling party/parties ceased in the last 12 months.`,
+    detail: `${recentlyCeased.length} controlling party/parties ceased within 12 months.`,
     benign:
       "Sales, buyouts and internal group transfers all show up this way. " +
       "Relevant because contracts and creditworthiness may have changed hands.",
@@ -401,11 +389,10 @@ const controlChange: Rule = (d) => {
 
 // ---- Secured lending -----------------------------------------------------
 
-const newCharges: Rule = (d) => {
-  const recent = d.charges.filter((c) => {
-    const age = monthsSince(c.createdOn);
-    return age !== null && age <= 12 && c.status === "outstanding";
-  });
+const newCharges: Rule = (d, asOf) => {
+  const recent = d.charges.filter(
+    (c) => within(c.createdOn, 12, asOf) && c.status === "outstanding"
+  );
 
   if (recent.length === 0) return null;
 
@@ -413,7 +400,7 @@ const newCharges: Rule = (d) => {
 
   return {
     id: "new_charges",
-    label: "New secured borrowing in the last year",
+    label: "New secured borrowing within the year",
     severity: "medium",
     detail: `${recent.length} outstanding charge(s) registered since ${
       recent[recent.length - 1].createdOn
@@ -427,15 +414,16 @@ const newCharges: Rule = (d) => {
 
 const heavyChargeLoad: Rule = (d) => {
   const outstanding = d.charges.filter((c) => c.status === "outstanding");
-  // CALIBRATION v2: threshold raised from 5 to 8. Established companies of any
-  // size routinely carry a handful of charges.
   if (outstanding.length < 8) return null;
 
   return {
     id: "heavy_charge_load",
     label: "Large number of outstanding charges",
-    severity: "low",
-    detail: `${outstanding.length} charges remain outstanding against the company.`,
+    // Scores zero. Backtest: 10% of failures vs 22% of survivors — mildly
+    // BACKWARDS, because asset-heavy survivors carry the most charges.
+    // Kept as context, removed from the arithmetic.
+    severity: "info",
+    detail: `${outstanding.length} charges were outstanding against the company.`,
     benign:
       "Asset-heavy businesses such as property and equipment leasing routinely " +
       "carry many charges. Meaningful mainly relative to sector peers.",
@@ -445,18 +433,20 @@ const heavyChargeLoad: Rule = (d) => {
 
 // ---- Director track record ----------------------------------------------
 
-const directorFailureHistory: Rule = (d) => {
-  // Ethics boundary: we only reach this data through directors of the company
-  // the user searched. There is no path from a person's name.
+const directorFailureHistory: Rule = (d, asOf) => {
+  // Ethics boundary: reached only through directors of the company the user
+  // searched. There is no path from a person's name.
   //
-  // CALIBRATION v2: count only INSOLVENT outcomes, not dissolutions, and judge
-  // them as a proportion of the director's total appointments. See the comment
-  // on INSOLVENT_OUTCOMES above — this was the single biggest false-positive
-  // source in v1.
+  // Counts only INSOLVENT outcomes, not dissolutions, judged as a proportion
+  // of total appointments. Backtest: fired only in companies that failed.
   const flagged = d.directorHistories
     .map((dir) => {
-      const total = dir.appointments.length;
-      const insolvent = dir.appointments.filter((a) =>
+      const appointments = dir.appointments.filter((a) => {
+        const age = monthsBefore(a.appointedOn, asOf);
+        return age === null || age >= 0; // exclude appointments after the cutoff
+      });
+      const total = appointments.length;
+      const insolvent = appointments.filter((a) =>
         INSOLVENT_OUTCOMES.includes(a.companyStatus ?? "")
       ).length;
       return { name: dir.name, insolvent, total, share: total > 0 ? insolvent / total : 0 };
@@ -488,17 +478,17 @@ const directorFailureHistory: Rule = (d) => {
   };
 };
 
-// ---- Context (scores zero, but the reader should know) -------------------
+// ---- Context -------------------------------------------------------------
 
-const youngCompany: Rule = (d) => {
-  const age = monthsSince(d.profile.incorporatedOn);
-  if (age === null || age > 24) return null;
+const youngCompany: Rule = (d, asOf) => {
+  const age = monthsBefore(d.profile.incorporatedOn, asOf);
+  if (age === null || age > 24 || age < 0) return null;
 
   return {
     id: "young_company",
     label: "Company is less than two years old",
     severity: "info",
-    detail: `Incorporated ${d.profile.incorporatedOn}, roughly ${Math.round(age)} months ago.`,
+    detail: `Incorporated ${d.profile.incorporatedOn}, roughly ${Math.round(age)} months earlier.`,
     benign:
       "Not a risk signal in itself. It does mean there is little filing history " +
       "to judge, so the absence of warnings is weak evidence of health.",
@@ -521,7 +511,7 @@ const insolvencyHistory: Rule = (d) => {
   };
 };
 
-/** Every rule the engine runs. Add a new signal by adding a function here. */
+/** Every rule the engine runs. Add a signal by adding a function here. */
 const RULES: Rule[] = [
   accountsOverdue,
   confirmationStatementOverdue,
@@ -546,10 +536,8 @@ const RULES: Rule[] = [
 /* ------------------------------------------------------------------ */
 
 /**
- * Overrides: facts so decisive that the arithmetic should not get a vote.
- *
- * Scoring systems that can average away a fatal fact are dangerous. A company
- * in liquidation with otherwise tidy filings must not come out amber.
+ * Facts so decisive that the arithmetic should not get a vote. Scoring systems
+ * that can average away a fatal fact are dangerous.
  */
 function findOverride(d: Dossier): { band: Band; reason: string } | null {
   const status = d.profile.status;
@@ -581,15 +569,19 @@ function findOverride(d: Dossier): { band: Band; reason: string } | null {
 }
 
 /**
- * Run every rule, total the points, and decide the band.
+ * Run every rule, total the points, decide the band.
  *
- * This function is pure: same dossier in, same assessment out, every time.
- * That is what makes it testable and what makes the score defensible.
+ * `asOf` defaults to the dossier's own fetch time, which means live lookups
+ * score against today and rewound dossiers (lib/risk/rewind.ts sets fetchedAt
+ * to the cutoff) score against their historical date — with no change needed
+ * at any call site.
+ *
+ * Pure function: same inputs, same assessment, every time.
  */
-export function assess(d: Dossier): Assessment {
-  // .map runs each rule; .filter drops the nulls (rules that found nothing).
-  const signals = RULES.map((rule) => rule(d)).filter((s): s is Signal => s !== null);
+export function assess(d: Dossier, asOf?: Date): Assessment {
+  const at = asOf ?? new Date(d.fetchedAt);
 
+  const signals = RULES.map((rule) => rule(d, at)).filter((s): s is Signal => s !== null);
   const score = signals.reduce((total, s) => total + POINTS[s.severity], 0);
 
   const override = findOverride(d);
@@ -605,7 +597,6 @@ export function assess(d: Dossier): Assessment {
     band = "green";
   }
 
-  // Sort so the most serious findings appear first in any UI.
   const order: Record<Severity, number> = { high: 0, medium: 1, low: 2, info: 3 };
   signals.sort((a, b) => order[a.severity] - order[b.severity]);
 
@@ -617,6 +608,6 @@ export function assess(d: Dossier): Assessment {
     signals,
     override: override?.reason,
     dataGaps: d.partialFailures,
-    assessedAt: new Date().toISOString(),
+    assessedAt: at.toISOString(),
   };
 }

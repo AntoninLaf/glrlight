@@ -303,3 +303,54 @@ export async function buildDossier(companyNumber: string): Promise<Dossier> {
     partialFailures,
   };
 }
+
+/* ------------------------------------------------------------------ */
+/* Advanced search — ADD THIS TO THE END OF lib/ch/client.ts           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Advanced search: filter the whole register by status, sector and dates.
+ *
+ * This is what makes the backtest possible. Ordinary search matches names; we
+ * need "companies in liquidation, incorporated before 2015, in this sector",
+ * which is a different question entirely.
+ */
+export interface AdvancedSearchOptions {
+  /** e.g. ["liquidation", "administration", "receivership"] or ["active"] */
+  companyStatus?: string[];
+  /** Standard Industrial Classification codes, for matching controls to cases */
+  sicCodes?: string[];
+  incorporatedFrom?: string; // YYYY-MM-DD
+  incorporatedTo?: string;
+  size?: number; // 1–5000
+  startIndex?: number;
+}
+
+export async function advancedSearch(
+  options: AdvancedSearchOptions
+): Promise<SearchHit[]> {
+  const params = new URLSearchParams();
+
+  if (options.companyStatus?.length) {
+    params.set("company_status", options.companyStatus.join(","));
+  }
+  if (options.sicCodes?.length) {
+    params.set("sic_codes", options.sicCodes.join(","));
+  }
+  if (options.incorporatedFrom) params.set("incorporated_from", options.incorporatedFrom);
+  if (options.incorporatedTo) params.set("incorporated_to", options.incorporatedTo);
+  params.set("size", String(options.size ?? 100));
+  if (options.startIndex) params.set("start_index", String(options.startIndex));
+
+  const data = await chFetch<any>(`/advanced-search/companies?${params.toString()}`, {
+    allow404: true, // "no companies found" is an answer, not a failure
+  });
+
+  return (data?.items ?? []).map((item: any) => ({
+    companyNumber: item.company_number,
+    name: item.company_name,
+    status: item.company_status,
+    incorporatedOn: item.date_of_creation,
+    addressSnippet: item.registered_office_address?.locality,
+  }));
+}
