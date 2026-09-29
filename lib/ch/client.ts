@@ -96,13 +96,25 @@ export async function searchCompanies(query: string, limit = 10): Promise<Search
   const data = await chFetch<any>(
     `/search/companies?q=${encodeURIComponent(query)}&items_per_page=${limit}`
   );
-  return (data?.items ?? []).map((item: any) => ({
+      const hits: SearchHit[] = (data?.items ?? []).map((item: any) => ({
     companyNumber: item.company_number,
     name: item.title,
     status: item.company_status,
     incorporatedOn: item.date_of_creation,
     addressSnippet: item.address_snippet,
   }));
+
+  // Companies House ranks by name match alone, which surfaces long-closed
+  // entities ahead of trading ones — searching "accenture" returns a plc that
+  // re-registered into another form years ago. Someone checking a counterparty
+  // almost always means the company that still exists, so trading companies
+  // rank first. The rest stay in the list as alternatives.
+  const stillTrading = (s: string) => s === "active" || s === "open" || s === "registered";
+
+  return hits.sort((a, b) => {
+    const diff = Number(stillTrading(b.status)) - Number(stillTrading(a.status));
+    return diff !== 0 ? diff : 0; // otherwise keep Companies House's own order
+  });
 }
 
 /* ------------------------------------------------------------------ */

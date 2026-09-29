@@ -558,10 +558,24 @@ function findOverride(d: Dossier): { band: Band; reason: string } | null {
     };
   }
 
-  if (d.profile.statusDetail?.includes("strike-off")) {
+    if (d.profile.statusDetail?.includes("strike-off")) {
     return {
       band: "red",
       reason: "The Registrar has an active proposal to strike this company off the register.",
+    };
+  }
+
+  // Anything that is not currently trading must not come out green, even with a
+  // spotless record. "converted-closed" means the entity re-registered into
+  // another form; "removed" and "closed" mean it is no longer on the register as
+  // a trading company. None of these is distress, so the band is amber rather
+  // than red — but you cannot contract with an entity that does not exist, and
+  // the reader needs to go and find the successor.
+  const TRADING = ["active", "open", "registered"];
+  if (!TRADING.includes(status)) {
+    return {
+      band: "amber",
+      reason: `This entity is recorded as "${status}" and is not currently trading. It was most likely converted, re-registered or removed, and a successor company now holds the business. Check that you have the right entity before going further.`,
     };
   }
 

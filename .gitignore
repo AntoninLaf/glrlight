@@ -43,3 +43,5 @@ next-env.d.ts
 BACKTEST.md
 backtest-results.json
 baseline-results.json
+
+STUDY-NOTES.md
